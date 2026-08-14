@@ -10765,6 +10765,7 @@ TEST(APFloatTest, getArbitraryFPFormatSizeInBits) {
   EXPECT_EQ(8u, APFloat::getArbitraryFPFormatSizeInBits("Float8E4M3B11FNUZ"));
   EXPECT_EQ(8u, APFloat::getArbitraryFPFormatSizeInBits("Float8E3M4"));
   EXPECT_EQ(8u, APFloat::getArbitraryFPFormatSizeInBits("Float8E8M0FNU"));
+  EXPECT_EQ(8u, APFloat::getArbitraryFPFormatSizeInBits("Float8E5M3FNU"));
   EXPECT_EQ(6u, APFloat::getArbitraryFPFormatSizeInBits("Float6E3M2FN"));
   EXPECT_EQ(6u, APFloat::getArbitraryFPFormatSizeInBits("Float6E2M3FN"));
   EXPECT_EQ(4u, APFloat::getArbitraryFPFormatSizeInBits("Float4E2M1FN"));
