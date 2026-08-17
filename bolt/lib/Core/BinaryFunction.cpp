@@ -24,6 +24,7 @@
 #include "llvm/ADT/SmallSet.h"
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/ADT/StringRef.h"
+#include "llvm/BinaryFormat/ELF.h"
 #include "llvm/Demangle/Demangle.h"
 #include "llvm/MC/MCAsmInfo.h"
 #include "llvm/MC/MCContext.h"
@@ -1420,6 +1421,28 @@ Error BinaryFunction::disassemble() {
     bool IsUnsupported = BC.MIB->isUnsupportedInstruction(Instruction);
     if (IsUnsupported)
       setIgnored();
+
+    // Recover linker-resolved intra-section calls without relocations. The
+    // current instruction is the JALR and the AUIPC is four bytes earlier in
+    // the instruction map. Resymbolizing the AUIPC lets BOLT update the pair
+    // if function reordering moves the caller relative to the callee.
+    if (BC.isRISCV() && Offset >= 4) {
+      auto PrevII = Instructions.find(Offset - 4);
+      if (PrevII != Instructions.end() &&
+          BC.MIB->isUnsymbolizedRISCVCall(PrevII->second, Instruction)) {
+        const uint64_t Target =
+            AbsoluteInstrAddr - 4 +
+            BC.MIB->getUnsymbolizedRISCVCallOffset(PrevII->second, Instruction);
+        if (BinaryFunction *TargetBF = BC.getBinaryFunctionAtAddress(Target)) {
+          int64_t Value = 0;
+          const bool Replaced = BC.MIB->replaceImmWithSymbolRef(
+              PrevII->second, TargetBF->getSymbol(), /*Addend=*/0, Ctx.get(),
+              Value, ELF::R_RISCV_CALL_PLT);
+          (void)Replaced;
+          assert(Replaced && "cannot symbolize RISC-V call");
+        }
+      }
+    }
 
     if (MIB->isBranch(Instruction) || MIB->isCall(Instruction)) {
       uint64_t TargetAddress = 0;

@@ -19,6 +19,7 @@
 #include "llvm/MC/MCInstBuilder.h"
 #include "llvm/MC/MCSubtargetInfo.h"
 #include "llvm/Support/ErrorHandling.h"
+#include "llvm/Support/MathExtras.h"
 
 #define DEBUG_TYPE "mcplus"
 
@@ -26,6 +27,23 @@ using namespace llvm;
 using namespace bolt;
 
 namespace {
+
+bool isValidUnsymbolizedCallAUIPC(const MCInst &Inst) {
+  if (Inst.getOpcode() != RISCV::AUIPC || Inst.getNumOperands() != 2)
+    return false;
+
+  const MCOperand &Destination = Inst.getOperand(0);
+  return Destination.isReg() && Destination.getReg() != RISCV::X0 &&
+         Inst.getOperand(1).isImm();
+}
+
+bool isValidUnsymbolizedCallJALR(const MCInst &Inst) {
+  if (Inst.getOpcode() != RISCV::JALR || Inst.getNumOperands() != 3)
+    return false;
+
+  return Inst.getOperand(0).isReg() && Inst.getOperand(1).isReg() &&
+         Inst.getOperand(2).isImm();
+}
 
 class RISCVMCPlusBuilder : public MCPlusBuilder {
   bool isRV64() const { return STI->hasFeature(RISCV::Feature64Bit); }
@@ -502,6 +520,31 @@ public:
 
     assert(Second.getOpcode() == RISCV::JALR);
     return true;
+  }
+
+  bool isUnsymbolizedRISCVCall(const MCInst &First,
+                               const MCInst &Second) const override {
+    if (!isValidUnsymbolizedCallAUIPC(First) ||
+        !isValidUnsymbolizedCallJALR(Second))
+      return false;
+
+    if (Second.getOperand(1).getReg() != First.getOperand(0).getReg())
+      return false;
+
+    const MCPhysReg Link = Second.getOperand(0).getReg();
+    return Link == RISCV::X1 || Link == RISCV::X0;
+  }
+
+  int64_t getUnsymbolizedRISCVCallOffset(const MCInst &First,
+                                         const MCInst &Second) const override {
+    // The RV32I "Integer Computational Instructions" section defines AUIPC's
+    // offset as the sign-extended 20-bit U-immediate shifted left by 12. The
+    // "Control Transfer Instructions" section defines JALR as adding its
+    // sign-extended 12-bit I-immediate and clearing target bit zero. Mask the
+    // decoded AUIPC operand back to its encoded field before sign extension.
+    const int64_t Hi = SignExtend64<32>(
+        (static_cast<uint64_t>(First.getOperand(1).getImm()) & 0xfffff) << 12);
+    return (Hi + Second.getOperand(2).getImm()) & ~1LL;
   }
 
   uint16_t getMinFunctionAlignment() const override {
