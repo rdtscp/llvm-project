@@ -516,6 +516,7 @@ static void emitDWOBuilder(const std::string &DWOName,
   // Populate debug_info and debug_abbrev for current dwo into StringRef.
   DWODIEBuilder.generateAbbrevs();
   DWODIEBuilder.finish();
+  LocWriter.updateReferences(DWODIEBuilder);
 
   SmallVector<char, 20> OutBuffer;
   std::shared_ptr<raw_svector_ostream> ObjOS =
@@ -1061,6 +1062,8 @@ void DWARFRewriter::updateDebugInfo() {
     mergePerBucketRanges(*BucketDIEBlder, LocalWriters[Idx], SortedCUs);
     finalizeCompileUnits(*BucketDIEBlder, DIEBlder, *Streamer, OffsetMap,
                          BucketDIEBlder->getProcessedCUs(), *FinalAddrWriter);
+    for (DWARFUnit *CU : BucketDIEBlder->getProcessedCUs())
+      LocListWritersByCU.at(CU->getOffset())->updateReferences(*BucketDIEBlder);
 
     // Release memory for this bucket.
     BucketDIEBlders[Idx].reset();
@@ -1447,7 +1450,7 @@ void DWARFRewriter::updateUnitDebugInfo(
               // information.
               OutputLL = InputLL;
             }
-            DebugLocWriter.addList(DIEBldr, *Die, LocAttrInfo, OutputLL);
+            DebugLocWriter.addList(DIEBldr, *Die, LocAttrInfo, OutputLL, Unit);
           }
         } else {
           assert((doesFormBelongToClass(LocAttrInfo.getForm(),
@@ -1503,15 +1506,28 @@ void DWARFRewriter::updateUnitDebugInfo(
               continue;
             }
 
+            bool ValidExpression = true;
             for (const DWARFExpression::Operation &Expr : LocExpr) {
-              uint32_t CurEndOffset = PrevOffset + 1;
-              if (Expr.getDescription().Op.size() == 1)
-                CurEndOffset = Expr.getOperandEndOffset(0);
-              if (Expr.getDescription().Op.size() == 2)
-                CurEndOffset = Expr.getOperandEndOffset(1);
-              if (Expr.getDescription().Op.size() > 2)
-                errs() << "BOLT-WARNING: [internal-dwarf-error]: Unsupported "
-                          "number of operands.\n";
+              if (Expr.isError() || Expr.getEndOffset() <= PrevOffset ||
+                  Expr.getEndOffset() > Sblock.size()) {
+                ValidExpression = false;
+                break;
+              }
+              uint64_t OperandStart = PrevOffset + 1;
+              for (unsigned I = 0; I < Expr.getNumOperands(); ++I) {
+                const uint64_t OperandEnd = Expr.getOperandEndOffset(I);
+                if (OperandEnd < OperandStart || OperandEnd > Sblock.size() ||
+                    (OperandEnd == OperandStart &&
+                     Expr.getDescription().Op[I] !=
+                         DWARFExpression::Operation::SizeBlock)) {
+                  ValidExpression = false;
+                  break;
+                }
+                OperandStart = OperandEnd;
+              }
+              if (!ValidExpression)
+                break;
+              const uint32_t CurEndOffset = Expr.getEndOffset();
               // not addr index, just copy.
               if (!(Expr.getCode() == dwarf::DW_OP_GNU_addr_index ||
                     Expr.getCode() == dwarf::DW_OP_addrx)) {
@@ -1537,7 +1553,11 @@ void DWARFRewriter::updateUnitDebugInfo(
                 // offset for each expr.
                 SmallString<8> Tmp;
                 raw_svector_ostream OSE(Tmp);
-                encodeULEB128(AddrIndex, OSE);
+                // DIEBuilder reserves address-index slots in expressions with
+                // type references. Keep that width so branch displacements and
+                // nested block lengths established there remain valid.
+                const unsigned OldSize = CurEndOffset - PrevOffset - 1;
+                encodeULEB128(AddrIndex, OSE, OldSize >= 5 ? OldSize : 0);
 
                 DIEBldr.addValue(NewAttr, static_cast<dwarf::Attribute>(0),
                                  dwarf::DW_FORM_data1,
@@ -1550,6 +1570,13 @@ void DWARFRewriter::updateUnitDebugInfo(
                 }
               }
               PrevOffset = CurEndOffset;
+            }
+
+            if (!ValidExpression) {
+              errs() << "BOLT-WARNING: [internal-dwarf-error]: cannot rewrite "
+                        "location expression address indices; preserving "
+                        "original expression\n";
+              continue;
             }
 
             // update the size since the index might be changed

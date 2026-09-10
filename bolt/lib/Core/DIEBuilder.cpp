@@ -10,6 +10,7 @@
 #include "bolt/Core/BinaryContext.h"
 #include "bolt/Core/DebugData.h"
 #include "bolt/Core/ParallelUtilities.h"
+#include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/BinaryFormat/Dwarf.h"
 #include "llvm/CodeGen/DIE.h"
@@ -22,9 +23,11 @@
 #include "llvm/DebugInfo/DWARF/LowLevel/DWARFExpression.h"
 #include "llvm/Support/Casting.h"
 #include "llvm/Support/Debug.h"
+#include "llvm/Support/Endian.h"
 #include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/LEB128.h"
+#include "llvm/Support/MathExtras.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -107,14 +110,39 @@ void DIEBuilder::updateReferences() {
     SrcDIEInfo->Die->replaceValue(getState().DIEAlloc, Attr, Form,
                                   DIEInteger(NewAddr));
   }
+  getState().AddrReferences.clear();
+}
 
+void DIEBuilder::updateLocationReferences() {
   // Handling references in location expressions.
   for (LocWithReference &LocExpr : getState().LocWithReferencesToProcess) {
+    // Address indices may have been rewritten since preparation. Patch the
+    // current attribute, whose padded type operands still hold input offsets.
+    DIEValue Current = LocExpr.Die.findAttribute(LocExpr.Attr);
+    if (!Current)
+      continue;
+    const DIEValueList &Values =
+        LocExpr.Form == dwarf::DW_FORM_exprloc
+            ? static_cast<const DIEValueList &>(Current.getDIELoc())
+            : static_cast<const DIEValueList &>(Current.getDIEBlock());
+    SmallVector<uint8_t, 32> Input;
+    for (const DIEValue &Value : Values.values())
+      Input.push_back(Value.getDIEInteger().getValue());
     SmallVector<uint8_t, 32> Buffer;
-    DataExtractor Data(LocExpr.BlockData, LocExpr.U.isLittleEndian());
-    DWARFExpression Expr(Data, LocExpr.U.getAddressByteSize(),
-                         LocExpr.U.getFormParams().Format);
-    cloneExpression(Data, Expr, LocExpr.U, Buffer, CloneExpressionStage::PATCH);
+    Expected<bool> HasReference = rewriteExpressionReferences(
+        Input, LocExpr.U, Buffer, ExpressionStage::Patch);
+    if (!HasReference) {
+      BC.errs()
+          << "BOLT-WARNING: [internal-dwarf-error]: cannot patch location "
+             "expression: "
+          << toString(HasReference.takeError()) << '\n';
+      continue;
+    }
+    if (Buffer.size() != Input.size()) {
+      BC.errs() << "BOLT-WARNING: [internal-dwarf-error]: location expression "
+                   "size changed while patching references\n";
+      continue;
+    }
 
     DIEValueList *AttrVal;
     if (LocExpr.Form == dwarf::DW_FORM_exprloc) {
@@ -143,6 +171,7 @@ void DIEBuilder::updateReferences() {
     LocExpr.Die.replaceValue(getState().DIEAlloc, LocExpr.Attr, LocExpr.Form,
                              Value);
   }
+  getState().LocWithReferencesToProcess.clear();
 }
 
 uint32_t DIEBuilder::allocDIE(const DWARFUnit &DU, const DWARFDie &DDie,
@@ -565,6 +594,7 @@ void DIEBuilder::finish() {
       dbgs() << Twine::utohexstr(Address) << "\n";
     }
   }
+  updateLocationReferences();
 }
 
 void DIEBuilder::populateDebugNamesTable(
@@ -607,6 +637,7 @@ void DIEBuilder::updateDebugNamesTable() {
       continue;
     finalizeDebugNamesTableForCU(*CU, DebugNamesUnitSize);
   }
+  // Debug names resolve cross-CU references using their original offsets.
   updateReferences();
 }
 
@@ -725,81 +756,168 @@ void DIEBuilder::cloneStringAttribute(
   }
 }
 
-bool DIEBuilder::cloneExpression(const DataExtractor &Data,
-                                 const DWARFExpression &Expression,
-                                 DWARFUnit &U,
-                                 SmallVectorImpl<uint8_t> &OutputBuffer,
-                                 const CloneExpressionStage &Stage) {
+Expected<bool>
+DIEBuilder::rewriteExpressionReferences(ArrayRef<uint8_t> Input, DWARFUnit &U,
+                                        SmallVectorImpl<uint8_t> &Output,
+                                        ExpressionStage Stage) {
   using Encoding = DWARFExpression::Operation::Encoding;
-  using Descr = DWARFExpression::Operation::Description;
-  uint64_t OpOffset = 0;
-  bool DoesContainReference = false;
-  for (const DWARFExpression::Operation &Op : Expression) {
-    const Descr &Description = Op.getDescription();
-    // DW_OP_const_type is variable-length and has 3
-    // operands. Thus far we only support 2.
-    if ((Description.Op.size() == 2 &&
-         Description.Op[0] == Encoding::BaseTypeRef) ||
-        (Description.Op.size() == 2 &&
-         Description.Op[1] == Encoding::BaseTypeRef &&
-         Description.Op[0] != Encoding::Size1 &&
-         Description.Op[0] != Encoding::SizeLEB))
-      BC.outs() << "BOLT-WARNING: [internal-dwarf-error]: unsupported DW_OP "
-                   "encoding.\n";
+  struct Branch {
+    uint64_t Target;
+    uint64_t Offset;
+  };
+  const unsigned OffsetSize = dwarf::getDwarfOffsetByteSize(U.getFormat());
+  const unsigned ReferenceSize = (OffsetSize * 8 + 6) / 7;
+  bool BranchOverflow = false;
+  auto appendULEB = [](SmallVectorImpl<uint8_t> &Buffer, uint64_t Value,
+                       unsigned PadTo = 0) {
+    uint8_t Bytes[10];
+    const unsigned Size = encodeULEB128(Value, Bytes, PadTo);
+    Buffer.append(Bytes, Bytes + Size);
+  };
 
-    if ((Description.Op.size() == 1 &&
-         Description.Op[0] == Encoding::BaseTypeRef) ||
-        (Description.Op.size() == 2 &&
-         Description.Op[1] == Encoding::BaseTypeRef &&
-         (Description.Op[0] == Encoding::Size1 ||
-          Description.Op[0] == Encoding::SizeLEB))) {
-      assert(OpOffset < Op.getEndOffset());
-      const uint32_t ULEBsize = Op.getEndOffset() - OpOffset - 1;
-      (void)ULEBsize;
-      assert(ULEBsize <= 16);
-
-      // Copy over the operation.
-      OutputBuffer.push_back(Op.getCode());
-      uint64_t RefOffset;
-      if (Description.Op.size() == 1) {
-        RefOffset = Op.getRawOperand(0);
-      } else {
-        const StringRef FirstOpBytes =
-            Data.getData().slice(OpOffset + 1, Op.getOperandEndOffset(0));
-        OutputBuffer.append(FirstOpBytes.begin(), FirstOpBytes.end());
-        RefOffset = Op.getRawOperand(1);
+  // Each entry_value block has its own instruction boundaries and branch
+  // destinations. Serialize children first, including their length fields,
+  // before translating branches in the enclosing expression.
+  auto rewrite = [&](auto &&Rewrite, ArrayRef<uint8_t> Bytes,
+                     SmallVectorImpl<uint8_t> &Buffer,
+                     unsigned Depth) -> Expected<bool> {
+    if (Depth == 64)
+      return createStringError("location expression nesting is too deep");
+    DataExtractor Data(Bytes, U.isLittleEndian());
+    DWARFExpression Expression(Data, U.getAddressByteSize(), U.getFormat());
+    SmallDenseMap<uint64_t, uint64_t, 16> Offsets;
+    SmallVector<Branch, 2> Branches;
+    bool HasReference = false;
+    for (auto It = Expression.begin(), End = Expression.end(); It != End;) {
+      const DWARFExpression::Operation &Op = *It;
+      const uint64_t OpOffset = It.getOffset();
+      const uint64_t OpEnd = Op.getEndOffset();
+      if (Op.isError())
+        return createStringError("cannot decode DW_OP at offset 0x%llx",
+                                 static_cast<unsigned long long>(OpOffset));
+      if (OpEnd <= OpOffset || OpEnd > Bytes.size())
+        return createStringError("invalid location expression operand");
+      // The expression decoder does not propagate every DataExtractor error.
+      // Check that each operand was consumed, and opaque blocks stay in bounds.
+      uint64_t OperandStart = OpOffset + 1;
+      const auto &Encodings = Op.getDescription().Op;
+      for (unsigned I = 0; I < Encodings.size(); ++I) {
+        const uint64_t OperandEnd = Op.getOperandEndOffset(I);
+        if (OperandEnd < OperandStart || OperandEnd > Bytes.size() ||
+            (OperandEnd == OperandStart && Encodings[I] != Encoding::SizeBlock))
+          return createStringError("invalid location expression operand");
+        OperandStart = OperandEnd;
       }
-      uint32_t Offset = 0;
-      if (RefOffset > 0 || Op.getCode() != dwarf::DW_OP_convert) {
-        DoesContainReference = true;
-        std::optional<uint32_t> RefDieID =
-            getAllocDIEId(U, U.getOffset() + RefOffset);
-        std::optional<uint32_t> RefUnitID = getUnitId(U);
-        if (RefDieID.has_value() && RefUnitID.has_value()) {
-          DIEInfo &RefDieInfo = getDIEInfo(*RefUnitID, *RefDieID);
-          if (DIE *Clone = RefDieInfo.Die)
-            Offset = Stage == CloneExpressionStage::INIT ? RefOffset
-                                                         : Clone->getOffset();
-          else
-            BC.errs() << "BOLT-WARNING: [internal-dwarf-error]: base type ref "
-                         "doesn't point to "
-                         "DW_TAG_base_type.\n";
+
+      Offsets[OpOffset] = Buffer.size();
+      if (Op.getCode() == dwarf::DW_OP_entry_value ||
+          Op.getCode() == dwarf::DW_OP_GNU_entry_value) {
+        const uint64_t Size = Op.getRawOperand(0);
+        if (Size > Bytes.size() - OpEnd)
+          return createStringError("entry_value block exceeds its expression");
+        SmallVector<uint8_t, 32> Nested;
+        Expected<bool> HasNestedReference =
+            Rewrite(Rewrite, Bytes.slice(OpEnd, Size), Nested, Depth + 1);
+        if (!HasNestedReference)
+          return HasNestedReference.takeError();
+        HasReference |= *HasNestedReference;
+        Buffer.push_back(Op.getCode());
+        appendULEB(Buffer, Nested.size());
+        Buffer.append(Nested);
+        It = It.skipBytes(Size);
+        continue;
+      }
+
+      if (Op.getCode() == dwarf::DW_OP_skip ||
+          Op.getCode() == dwarf::DW_OP_bra) {
+        const int16_t Displacement = Op.getRawOperand(0);
+        if ((Displacement >= 0 &&
+             uint64_t(Displacement) > Bytes.size() - OpEnd) ||
+            (Displacement < 0 && uint64_t(-int64_t(Displacement)) > OpEnd))
+          return createStringError("branch target is outside its expression");
+        Branches.push_back({OpEnd + Displacement, Buffer.size()});
+      }
+
+      Buffer.push_back(Op.getCode());
+      OperandStart = OpOffset + 1;
+      for (unsigned I = 0; I < Encodings.size(); ++I) {
+        const uint64_t OperandEnd = Op.getOperandEndOffset(I);
+        const uint64_t Value = Op.getRawOperand(I);
+        if (Encodings[I] == Encoding::BaseTypeRef &&
+            (Value != 0 || Op.getCode() != dwarf::DW_OP_convert)) {
+          if (OffsetSize == 4 && Value > UINT32_MAX)
+            return createStringError("base type reference exceeds DWARF32");
+          HasReference = true;
+          uint64_t Offset = Value;
+          if (Stage == ExpressionStage::Patch) {
+            const std::optional<uint32_t> UnitID = getUnitId(U);
+            const std::optional<uint32_t> DieID =
+                Value < U.getNextUnitOffset() - U.getOffset()
+                    ? getAllocDIEId(U, U.getOffset() + Value)
+                    : std::nullopt;
+            DIE *Target =
+                UnitID && DieID ? getDIEInfo(*UnitID, *DieID).Die : nullptr;
+            if (Target && Target->getTag() == dwarf::DW_TAG_base_type)
+              Offset = Target->getOffset();
+            else
+              BC.errs()
+                  << "BOLT-WARNING: [internal-dwarf-error]: cannot resolve "
+                     "base type reference 0x"
+                  << Twine::utohexstr(Value) << " in CU at 0x"
+                  << Twine::utohexstr(U.getOffset())
+                  << "; preserving original offset\n";
+          }
+          appendULEB(Buffer, Offset, ReferenceSize);
+        } else if (I == 0 && (Op.getCode() == dwarf::DW_OP_addrx ||
+                              Op.getCode() == dwarf::DW_OP_GNU_addr_index)) {
+          // The inline address-index rewrite runs between these two stages.
+          // Reserve its full index width too, so it can preserve the layout of
+          // expressions containing both address indices and DIE references.
+          if (Value > UINT32_MAX)
+            return createStringError("address index exceeds 32 bits");
+          appendULEB(Buffer, Value, 5);
+        } else {
+          const ArrayRef<uint8_t> Operand =
+              Bytes.slice(OperandStart, OperandEnd - OperandStart);
+          Buffer.append(Operand.begin(), Operand.end());
         }
+        OperandStart = OperandEnd;
       }
-      uint8_t ULEB[16];
-      // Hard coding to max size so size doesn't change when we update the
-      // offset.
-      encodeULEB128(Offset, ULEB, 4);
-      ArrayRef<uint8_t> ULEBbytes(ULEB, 4);
-      OutputBuffer.append(ULEBbytes.begin(), ULEBbytes.end());
-    } else {
-      // Copy over everything else unmodified.
-      const StringRef Bytes = Data.getData().slice(OpOffset, Op.getEndOffset());
-      OutputBuffer.append(Bytes.begin(), Bytes.end());
+      ++It;
     }
-    OpOffset = Op.getEndOffset();
-  }
-  return DoesContainReference;
+    Offsets[Bytes.size()] = Buffer.size();
+    for (const Branch &B : Branches) {
+      auto Target = Offsets.find(B.Target);
+      if (Target == Offsets.end())
+        return createStringError(
+            "branch target is not an instruction boundary");
+      const int64_t Displacement =
+          int64_t(Target->second) - int64_t(B.Offset + 3);
+      if (!isInt<16>(Displacement)) {
+        // Expressions without type references retain their original bytes.
+        // Only reject this candidate layout if it will actually be used.
+        BranchOverflow = true;
+        continue;
+      }
+      support::endian::write16(Buffer.data() + B.Offset + 1,
+                               static_cast<uint16_t>(Displacement),
+                               U.isLittleEndian() ? llvm::endianness::little
+                                                  : llvm::endianness::big);
+    }
+    return HasReference;
+  };
+
+  SmallVector<uint8_t, 32> Buffer;
+  Expected<bool> HasReference = rewrite(rewrite, Input, Buffer, 0);
+  if (!HasReference)
+    return HasReference.takeError();
+  if (*HasReference && BranchOverflow)
+    return createStringError("rewritten branch displacement exceeds 16 bits");
+  if (*HasReference)
+    Output.append(Buffer);
+  else
+    Output.append(Input.begin(), Input.end());
+  return *HasReference;
 }
 
 void DIEBuilder::cloneBlockAttribute(
@@ -830,13 +948,20 @@ void DIEBuilder::cloneBlockAttribute(
   if (DWARFAttribute::mayHaveLocationExpr(AttrSpec.Attr) &&
       (Val.isFormClass(DWARFFormValue::FC_Block) ||
        Val.isFormClass(DWARFFormValue::FC_Exprloc))) {
-    DataExtractor Data(Bytes, U.isLittleEndian());
-    DWARFExpression Expr(Data, U.getAddressByteSize(),
-                         U.getFormParams().Format);
-    if (cloneExpression(Data, Expr, U, Buffer, CloneExpressionStage::INIT))
-      getState().LocWithReferencesToProcess.emplace_back(
-          Bytes.vec(), U, Die, AttrSpec.Form, AttrSpec.Attr);
-    Bytes = Buffer;
+    Expected<bool> HasReference =
+        rewriteExpressionReferences(Bytes, U, Buffer, ExpressionStage::Prepare);
+    if (!HasReference) {
+      BC.errs()
+          << "BOLT-WARNING: [internal-dwarf-error]: cannot rewrite location "
+             "expression: "
+          << toString(HasReference.takeError())
+          << "; preserving original expression\n";
+    } else {
+      if (*HasReference)
+        getState().LocWithReferencesToProcess.emplace_back(
+            U, Die, AttrSpec.Form, AttrSpec.Attr);
+      Bytes = Buffer;
+    }
   }
   for (auto Byte : Bytes)
     Attr->addValue(getState().DIEAlloc, static_cast<dwarf::Attribute>(0),

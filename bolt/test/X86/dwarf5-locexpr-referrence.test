@@ -6,20 +6,32 @@
 # RUN: llvm-bolt %t.exe -o %t.bolt --update-debug-sections --debug-thread-count=4 --cu-processing-batch-size=4
 # RUN: llvm-dwarfdump --show-form --verbose --debug-info %t.bolt | FileCheck --check-prefix=CHECK %s
 # RUN: llvm-dwarfdump --show-form --verbose --debug-addr %t.bolt | FileCheck --check-prefix=CHECKADDR %s
+# RUN: llvm-dwarfdump --verify %t.bolt
+# RUN: llvm-bolt %t.exe -o %t.serial.bolt --update-debug-sections --debug-thread-count=1 --cu-processing-batch-size=1
+# RUN: llvm-dwarfdump --show-form --verbose --debug-info %t.serial.bolt | FileCheck --check-prefix=CHECK %s
+# RUN: llvm-dwarfdump --verify %t.serial.bolt
 
-## This test checks that we update relative DIE references with DW_OP_convert that are in locexpr
-## and checks the address table is correct.
+## This test checks that we update relative DIE references with DW_OP_convert in
+## location expressions and location lists, and checks the address table.
 
 # CHECK: version = 0x0005
+# CHECK: DW_TAG_formal_parameter
+# CHECK-NEXT: DW_AT_location
+# CHECK-NEXT: DW_OP_lit0, DW_OP_convert (0x[[#%.8x,LOC_TYPE:]]
+# CHECK-SAME: -> 0x[[#LOC_TYPE]]) "signed char"
 # CHECK: DW_TAG_variable
 # CHECK-NEXT: DW_AT_location
 # CHECK-SAME: DW_OP_convert (0x00000028 -> 0x00000028)
 # CHECK-SAME: DW_OP_convert (0x0000002c -> 0x0000002c)
+# CHECK: 0x[[#LOC_TYPE]]: DW_TAG_base_type
+# CHECK-NEXT: DW_AT_name {{.*}}"signed char"
 # CHECK: version = 0x0005
+# CHECK: 0x[[#%.8x,CU2_CHAR:]]: DW_TAG_base_type
+# CHECK: 0x[[#%.8x,CU2_INT:]]: DW_TAG_base_type
 # CHECK: DW_TAG_variable
 # CHECK-NEXT: DW_AT_location
-# CHECK-SAME: DW_OP_convert (0x00000028 -> 0x00000092)
-# CHECK-SAME: DW_OP_convert (0x0000002c -> 0x00000096)
+# CHECK-SAME: DW_OP_convert (0x00000028 -> 0x[[#CU2_CHAR]])
+# CHECK-SAME: DW_OP_convert (0x0000002c -> 0x[[#CU2_INT]])
 # CHECK: version = 0x0005
 
 # CHECKADDR: Addrs: [

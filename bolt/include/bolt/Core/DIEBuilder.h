@@ -17,12 +17,14 @@
 
 #include "bolt/Core/BinaryContext.h"
 #include "bolt/Core/DebugNames.h"
+#include "llvm/ADT/ArrayRef.h"
 #include "llvm/CodeGen/DIE.h"
 #include "llvm/DebugInfo/DWARF/DWARFAbbreviationDeclaration.h"
 #include "llvm/DebugInfo/DWARF/DWARFDie.h"
 #include "llvm/DebugInfo/DWARF/DWARFUnit.h"
 #include "llvm/DebugInfo/DWARF/LowLevel/DWARFExpression.h"
 #include "llvm/Support/Allocator.h"
+#include "llvm/Support/Error.h"
 
 #include <list>
 #include <memory>
@@ -84,10 +86,9 @@ private:
   /// Contains information so that we we can update references in locexpr after
   /// we calculated all the final DIE offsets.
   struct LocWithReference {
-    LocWithReference(std::vector<uint8_t> &&BlockData, DWARFUnit &U, DIE &Die,
-                     dwarf::Form Form, dwarf::Attribute Attr)
-        : BlockData(BlockData), U(U), Die(Die), Form(Form), Attr(Attr) {}
-    std::vector<uint8_t> BlockData;
+    LocWithReference(DWARFUnit &U, DIE &Die, dwarf::Form Form,
+                     dwarf::Attribute Attr)
+        : U(U), Die(Die), Form(Form), Attr(Attr) {}
     DWARFUnit &U;
     DIE &Die;
     dwarf::Form Form;
@@ -168,15 +169,6 @@ private:
       const DWARFAbbreviationDeclaration::AttributeSpec AttrSpec,
       const DWARFFormValue &Val);
 
-  enum class CloneExpressionStage { INIT, PATCH };
-  /// Clone an attribute in expression format. \p OutputBuffer will hold the
-  /// output content.
-  /// Returns true if Expression contains a reference.
-  bool cloneExpression(const DataExtractor &Data,
-                       const DWARFExpression &Expression, DWARFUnit &U,
-                       SmallVectorImpl<uint8_t> &OutputBuffer,
-                       const CloneExpressionStage &Stage);
-
   /// Clone an attribute in address format.
   void cloneAddressAttribute(
       DIE &Die, const DWARFUnit &U,
@@ -202,6 +194,9 @@ private:
 
   /// Update references once the layout is finalized.
   void updateReferences();
+
+  /// Patch inline location expressions after computing final DIE offsets.
+  void updateLocationReferences();
 
   /// Update the Offset and Size of DIE.
   /// Along with current CU, and DIE being processed and the new DIE offset to
@@ -349,6 +344,18 @@ public:
   }
   /// Finish current DIE construction.
   void finish();
+
+  enum class ExpressionStage { Prepare, Patch };
+
+  /// Rewrite base type references, preserving expression control flow and
+  /// nested block boundaries. Prepare retains original DIE offsets in padded
+  /// operands; Patch resolves them after DIE layout. Returns whether references
+  /// were found. On error, Output is unchanged. Unresolvable references retain
+  /// their original offsets with a warning, without changing the layout.
+  Expected<bool> rewriteExpressionReferences(ArrayRef<uint8_t> Input,
+                                             DWARFUnit &U,
+                                             SmallVectorImpl<uint8_t> &Output,
+                                             ExpressionStage Stage);
 
   /// Update debug names table.
   void updateDebugNamesTable();

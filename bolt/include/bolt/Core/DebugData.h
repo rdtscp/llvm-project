@@ -587,10 +587,13 @@ public:
 
   /// Writes out location lists and stores internal patches.
   virtual void addList(DIEBuilder &DIEBldr, DIE &Die, DIEValue &AttrInfo,
-                       DebugLocationsVector &LocList);
+                       DebugLocationsVector &LocList, DWARFUnit &Unit);
 
   /// Writes out locations in to a local buffer, and adds Debug Info patches.
   virtual void finalize(DIEBuilder &DIEBldr, DIE &Die);
+
+  /// Updates references in location expressions after DIE layout is finalized.
+  virtual void updateReferences(DIEBuilder &DIEBldr);
 
   /// Return internal buffer.
   virtual std::unique_ptr<DebugBufferVector> getBuffer();
@@ -658,10 +661,12 @@ public:
 
   /// Stores location lists internally to be written out during finalize phase.
   virtual void addList(DIEBuilder &DIEBldr, DIE &Die, DIEValue &AttrInfo,
-                       DebugLocationsVector &LocList) override;
+                       DebugLocationsVector &LocList, DWARFUnit &Unit) override;
 
   /// Writes out locations in to a local buffer and applies debug info patches.
   void finalize(DIEBuilder &DIEBldr, DIE &Die) override;
+
+  void updateReferences(DIEBuilder &DIEBldr) override;
 
   /// Returns CU ID.
   /// For Skeleton CU it is a CU Offset.
@@ -681,6 +686,18 @@ public:
   constexpr static uint32_t InvalidIndex = UINT32_MAX;
 
 private:
+  struct LocExpressionReference {
+    uint64_t Offset;
+    uint64_t Size;
+    DWARFUnit *Unit;
+    /// Original bytes: both stages must start with the same branch offsets and
+    /// nested block lengths, even if preparation changed the expression size.
+    SmallVector<uint8_t, 32> Expression;
+  };
+
+  void writeDWARF5LocList(DIEBuilder &DIEBldr, DIE &Die, DIEValue &AttrInfo,
+                          DebugLocationsVector &LocList, DWARFUnit &Unit);
+
   /// Writes out locations in to a local buffer and applies debug info patches.
   void finalizeDWARF5(DIEBuilder &DIEBldr, DIE &Die);
 
@@ -691,6 +708,7 @@ private:
   std::unique_ptr<DebugBufferVector> LocBodyBuffer;
   std::unique_ptr<raw_svector_ostream> LocBodyStream;
   std::vector<uint64_t> RelativeLocListOffsets;
+  std::vector<LocExpressionReference> LocExpressionReferences;
   uint32_t NumberOfEntries{0};
 };
 

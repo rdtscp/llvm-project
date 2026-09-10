@@ -7,10 +7,12 @@
 # RUN: llvm-bolt %t.exe -o %t.bolt --update-debug-sections
 # RUN: llvm-dwarfdump --show-form --verbose --debug-addr --debug-loclists \
 # RUN:   --debug-info %t.bolt | FileCheck --check-prefix=BOLT %s
+# RUN: llvm-readelf -x .debug_loclists %t.bolt | FileCheck --check-prefix=BYTES %s
 # RUN: llvm-dwarfdump --verify %t.bolt
 
 ## Check that BOLT rewrites a DWARF64 v5 loclistx location list and that the
-## decoded PC range tracks the rewritten function address.
+## decoded PC range tracks the rewritten function address. Typed references
+## use ten-byte slots to accommodate the full DWARF64 offset range.
 
 # INPUT-LABEL: .debug_info contents:
 # INPUT: Compile Unit:{{.*}} format = DWARF64, version = 0x0005
@@ -28,19 +30,25 @@
 # BOLT-NEXT: [
 # BOLT-SAME: 0x[[#%.16x,ADDR:]]
 # BOLT-SAME: 0x[[#ADDR + 3]]
+# BOLT-SAME: DW_OP_lit0, DW_OP_convert (0x[[#%.8x,TYPE:]]
+# BOLT-SAME: -> 0x[[#TYPE]]) "int", DW_OP_stack_value
+# BOLT: 0x[[#TYPE]]: DW_TAG_base_type
 
 # BOLT-LABEL: .debug_loclists contents:
 # BOLT: locations list header: length = 0x{{[0-9a-f]+}}, format = DWARF64
 # BOLT: 0x0000001c:
 # BOLT-NEXT: DW_LLE_startx_length
 # BOLT-SAME: 0x0000000000000003
-# BOLT-SAME: DW_OP_reg0 RAX
+# BOLT-SAME: DW_OP_lit0, DW_OP_convert
 
 # BOLT-LABEL: .debug_addr contents:
 # BOLT: Address table header: length = 0x{{[0-9a-f]+}}, format = DWARF64
 # BOLT: Addrs: [
 # BOLT-NEXT: 0x[[#ADDR]]
 # BOLT-NEXT: 0x0000000000000000
+
+## lit0, convert, ten-byte ULEB type reference, stack_value, end_of_list.
+# BYTES: 0x00000020 30a8{{[0-9a-f][0-9a-f]}}80 80808080 80808000 9f00
 
   .text
   .globl main
@@ -69,8 +77,12 @@ main:
   .byte 4                         # DW_LLE_offset_pair
   .uleb128 .Lfunc_begin0-.Lfunc_begin0
   .uleb128 .Lfunc_end0-.Lfunc_begin0
-  .byte 1                         # Loc expr size
-  .byte 0x50                      # DW_OP_reg0
+  .uleb128 .Lexpr_end-.Lexpr       # Loc expr size
+.Lexpr:
+  .byte 0x30, 0xa8                # DW_OP_lit0, DW_OP_convert
+  .uleb128 .Ltype-.Lcu_begin
+  .byte 0x9f                      # DW_OP_stack_value
+.Lexpr_end:
   .byte 0                         # DW_LLE_end_of_list
 .Ldebug_list_end:
 
@@ -115,9 +127,21 @@ main:
   .byte 0x22                      # DW_FORM_loclistx
   .byte 0
   .byte 0
+  .byte 4                         # Abbrev code
+  .byte 0x24                      # DW_TAG_base_type
+  .byte 0                         # DW_CHILDREN_no
+  .byte 0x03                      # DW_AT_name
+  .byte 0x0e                      # DW_FORM_strp
+  .byte 0x3e                      # DW_AT_encoding
+  .byte 0x0b                      # DW_FORM_data1
+  .byte 0x0b                      # DW_AT_byte_size
+  .byte 0x0b                      # DW_FORM_data1
+  .byte 0
+  .byte 0
   .byte 0
 
   .section .debug_info,"",@progbits
+.Lcu_begin:
   .long 0xffffffff                # DWARF64 marker
   .quad .Lcu_end-.Lcu_start       # DWARF64 unit length
 .Lcu_start:
@@ -140,6 +164,10 @@ main:
   .quad .Lstr_x                   # DW_AT_name
   .byte 0                         # DW_AT_location
   .byte 0                         # End subprogram children
+.Ltype:
+  .byte 4                         # DW_TAG_base_type
+  .quad .Lstr_int                 # DW_AT_name
+  .byte 5, 4                      # DW_ATE_signed, byte size
   .byte 0                         # End CU children
 .Lcu_end:
 
@@ -161,6 +189,8 @@ main:
   .asciz "main"
 .Lstr_x:
   .asciz "x"
+.Lstr_int:
+  .asciz "int"
 
   .section .debug_line,"",@progbits
 .Lline_table_start0:
